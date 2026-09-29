@@ -8,7 +8,7 @@ A small, reusable validator that sits between a trade event feed (blockchain ind
 | duplicate | copy of an event already accepted, dropped | `output/duplicates.csv` |
 | dead letter | cannot be trusted as-is, kept with reasons for repair or replay | `output/dead_letter.csv` |
 
-Nothing is dropped silently. Every decision is recorded with a reason code in `output/report.json`. The dead-letter and duplicate files keep the original raw values verbatim; `clean_trades.csv` carries the canonical (normalised) values used for analytics **and** the original source values in `src_*` columns, so every output row is still traceable to its input.
+Nothing is dropped silently. Every decision is recorded with a reason code in `output/report.json`. The dead-letter and duplicate files keep the original raw values verbatim; `clean_trades.csv` carries the canonical (normalised) values used for analytics **and** every original input column mirrored as `src_<name>`, so each accepted row is still fully traceable to its input.
 
 The validator and pipeline use only the Python standard library. `pytest` is needed for the tests only.
 
@@ -148,7 +148,7 @@ Accepted trades are returned sorted by `block_time`. `pipeline.py` reads the CSV
 Checks that the sample does not trigger but real feeds will:
 
 - Hex identifiers (`0x...`) are lowercased before comparison, because EVM addresses are case-insensitive; mixed-case is only a checksum ([EIP-55](https://eips.ethereum.org/EIPS/eip-55)). Other formats, such as [base58](https://digitalbazaar.github.io/base58-spec/) (used by Bitcoin and Solana), are case-sensitive and kept as-is.
-- `120000`, `120000.0` and `1.2E+5` are treated as the same amount.
+- `120000`, `120000.0` and `1.2E+5` are treated as the same amount. Amounts beyond `1e30` are rejected as corrupt (a real trade never reaches that magnitude, even in raw wei), which also prevents downstream `Decimal` overflow.
 - Timestamps are accepted as ISO-8601 (with `Z`, an offset, or naive, taken as UTC), Unix seconds or milliseconds, or time-only with `--feed-date`.
 - A present-but-unparseable `ingested_at` is flagged as `INVALID_INGESTED_AT`, kept distinct from an absent one (`MISSING_INGESTED_AT`) so reports can tell broken metadata from missing metadata.
 - `--strict-ids` enforces full-length EVM addresses and transaction hashes. It is off by default because the sample uses shortened identifiers.

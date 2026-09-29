@@ -38,6 +38,10 @@ REQUIRED_COLUMNS = (
 )
 NULL_TOKENS = {"", "null", "none"}
 VALID_SIDES = {"BUY", "SELL"}
+# Largest order of magnitude accepted for an amount. Even raw wei for an
+# implausibly huge trade stays well under 1e30; values beyond this are corrupt
+# (and would overflow Decimal arithmetic downstream), so they are rejected.
+MAX_AMOUNT_ADJUSTED_EXP = 30
 
 EVM_ADDRESS_RE = re.compile(r"^0x[0-9a-f]{40}$")
 EVM_TX_HASH_RE = re.compile(r"^0x[0-9a-f]{64}$")
@@ -249,7 +253,12 @@ def parse_timestamp(value: str, feed_date: date) -> datetime:
 
 
 def format_timestamp(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    dt = dt.astimezone(timezone.utc)
+    if dt.microsecond:
+        # keep sub-second precision instead of silently truncating it, so two
+        # block times that differ only below the second are not collapsed
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%f").rstrip("0") + "Z"
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def canonical_amount(amount: Decimal) -> str:
@@ -328,6 +337,13 @@ def parse_row(row_num: int, raw: Mapping[Optional[str], object], config: Validat
                     Severity.ERROR,
                     f"amount '{amount}' must be a finite number greater than zero",
                 )
+            elif value.adjusted() > MAX_AMOUNT_ADJUSTED_EXP:
+                event.add_issue(
+                    Code.INVALID_AMOUNT,
+                    Severity.ERROR,
+                    f"amount '{amount}' is implausibly large (>1e{MAX_AMOUNT_ADJUSTED_EXP}); "
+                    "likely a unit or encoding error",
+                )
             else:
                 event.amount = value
 
@@ -392,9 +408,16 @@ def check_event_ids(events: List[TradeEvent]) -> None:
             for e in group:
                 e.add_issue(Code.EVENT_ID_CONFLICT, Severity.ERROR, message, related)
             continue
-        # All identical: keep the first delivery, drop the rest.
-        original = group[0]
-        for event in group[1:]:
+        # All identical content: keep one delivery, drop the other copies. Pick
+        # the first delivery that is still usable as the original, so a copy is
+        # never marked a duplicate of a row that was dead-lettered for an
+        # unrelated reason (e.g. surplus columns) -- which would lose the trade.
+        original = next((e for e in group if e.status is not Status.DEAD_LETTER), None)
+        if original is None:
+            continue  # every copy is already dead-lettered on its own merits
+        for event in group:
+            if event is original or event.status is Status.DEAD_LETTER:
+                continue
             event.duplicate_of = original.event_id
             event.add_issue(
                 Code.DUPLICATE_EVENT_ID,

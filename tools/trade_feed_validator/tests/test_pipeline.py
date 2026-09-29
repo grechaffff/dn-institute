@@ -57,6 +57,32 @@ def test_clean_output_is_canonical_but_keeps_source_values(tmp_path):
     assert clean["src_side"] == " buy " and clean["src_amount"] == "120000.0"  # lineage
 
 
+def test_accepted_rows_keep_every_raw_column_including_extras(tmp_path):
+    # a feed with an extra column beyond the required schema
+    feed = tmp_path / "feed.csv"
+    feed.write_text(
+        "event_id,tx_hash,block_time,wallet,side,amount,ingested_at,venue\n"
+        "e1,0xAB,2026-01-01T00:00:00Z,0xWW,BUY,10,2026-01-01T00:00:01Z,binance\n",
+        encoding="utf-8",
+    )
+    assert main([str(feed), "--out", str(tmp_path / "out")]) == EXIT_OK
+    clean = read_csv(tmp_path / "out" / "clean_trades.csv")[0]
+    assert clean["src_event_id"] == "e1"   # raw event_id retained
+    assert clean["src_venue"] == "binance"  # arbitrary extra column retained
+
+
+def test_dead_letter_surfaces_overflow_column(tmp_path):
+    feed = tmp_path / "feed.csv"
+    feed.write_text(
+        "event_id,tx_hash,block_time,wallet,side,amount,ingested_at\n"
+        "e1,0xAB,2026-01-01T00:00:00Z,0xWW,BUY,10,2026-01-01T00:00:01Z,SHIFTED\n",
+        encoding="utf-8",
+    )
+    assert main([str(feed), "--out", str(tmp_path / "out")]) == EXIT_OK
+    dead = read_csv(tmp_path / "out" / "dead_letter.csv")[0]
+    assert dead["_overflow"] == "SHIFTED"  # surplus value preserved for repair
+
+
 def test_report_json_includes_sqlite_stats(tmp_path):
     db = tmp_path / "trades.sqlite"
     assert main([str(SAMPLE), "--out", str(tmp_path / "out"), "--sqlite", str(db)]) == EXIT_OK

@@ -105,6 +105,17 @@ def test_same_event_id_different_payload_quarantines_both():
     assert all(Code.EVENT_ID_CONFLICT in codes(e) for e in result.events)
 
 
+def test_identical_copy_survives_when_the_first_delivery_is_dead_lettered():
+    # first copy has surplus columns (dead-lettered); the clean copy under the
+    # same event_id must be kept, not marked a duplicate of the dead row
+    bad = row(event_id="e1")
+    bad[None] = ["surplus"]
+    result = validate_feed([bad, row(event_id="e1")])
+    assert result.events[0].status is Status.DEAD_LETTER
+    assert result.events[1].status is Status.ACCEPTED
+    assert len(result.accepted) == 1
+
+
 def test_event_id_conflict_dead_letters_every_member_even_a_repeat():
     # payloads A, B, A under one id: the third row must not become a "duplicate"
     # of the now-dead-lettered first row -- all three are conflicts.
@@ -163,11 +174,21 @@ def test_unparseable_block_time_is_not_treated_as_missing():
 
 # --- field validation ----------------------------------------------------
 
-@pytest.mark.parametrize("amount", ["abc", "0", "-5", "NaN", "Infinity", "1e"])
+@pytest.mark.parametrize("amount", ["abc", "0", "-5", "NaN", "Infinity", "1e", "1e999999999"])
 def test_invalid_amounts_are_quarantined(amount):
     evt = validate_feed([row(amount=amount)]).events[0]
     assert evt.status is Status.DEAD_LETTER
     assert Code.INVALID_AMOUNT in codes(evt)
+
+
+def test_astronomical_amount_does_not_crash_downstream_metrics():
+    # a finite but absurd amount must be rejected, not accepted and then
+    # blow up canonical_amount()/metrics with decimal.Overflow
+    from metrics import volume_summary
+
+    result = validate_feed([row(amount="1e999999999")])
+    assert result.accepted == []
+    assert volume_summary(result.accepted)["total_volume"] == "0"  # no crash
 
 
 def test_side_is_normalised():
@@ -266,3 +287,12 @@ def test_time_only_uses_feed_date():
     assert parse_timestamp("09:14:02", date(2026, 9, 28)) == datetime(
         2026, 9, 28, 9, 14, 2, tzinfo=timezone.utc
     )
+
+
+def test_format_timestamp_keeps_sub_second_precision():
+    from validator import format_timestamp
+
+    whole = datetime(2026, 9, 28, 10, 0, 0, tzinfo=timezone.utc)
+    frac = datetime(2026, 9, 28, 10, 0, 0, 123456, tzinfo=timezone.utc)
+    assert format_timestamp(whole) == "2026-09-28T10:00:00Z"
+    assert format_timestamp(frac) == "2026-09-28T10:00:00.123456Z"

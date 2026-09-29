@@ -45,11 +45,11 @@ EXIT_DEAD_LETTER = 1
 EXIT_BAD_INPUT = 2
 EXIT_IO = 3  # writing outputs or loading the SQLite sink failed
 
-CLEAN_COLUMNS = [
-    # canonical values for analytics ...
+# Canonical (normalised) columns emitted for analytics. Every original input
+# column is also emitted alongside these under a "src_" prefix (built per feed),
+# so the accepted file keeps the full raw record for lineage.
+CANONICAL_COLUMNS = [
     "event_id", "tx_hash", "block_time", "wallet", "side", "amount", "ingested_at", "dq_flags",
-    # ... plus the original source values, for lineage/audit
-    "src_tx_hash", "src_block_time", "src_wallet", "src_side", "src_amount", "src_ingested_at",
 ]
 
 
@@ -87,10 +87,10 @@ def _is_retryable(event: TradeEvent) -> bool:
     return bool(errors) and errors <= RETRYABLE_CODES
 
 
-def _clean_row(e: TradeEvent) -> dict:
-    """Analytics row: canonical (normalised) fields, plus the raw source
-    values under ``src_*`` so lineage is preserved in the same record."""
-    return {
+def _clean_row(e: TradeEvent, raw_cols: Sequence[str]) -> dict:
+    """Analytics row: canonical (normalised) fields, plus every original source
+    value under ``src_*`` so the full raw record is preserved for lineage."""
+    canonical = {
         "event_id": e.event_id,
         "tx_hash": e.tx_hash,
         "block_time": format_timestamp(e.block_time),
@@ -99,27 +99,26 @@ def _clean_row(e: TradeEvent) -> dict:
         "amount": canonical_amount(e.amount),
         "ingested_at": format_timestamp(e.ingested_at) if e.ingested_at else "",
         "dq_flags": ";".join(e.flags),
-        "src_tx_hash": e.raw.get("tx_hash", ""),
-        "src_block_time": e.raw.get("block_time", ""),
-        "src_wallet": e.raw.get("wallet", ""),
-        "src_side": e.raw.get("side", ""),
-        "src_amount": e.raw.get("amount", ""),
-        "src_ingested_at": e.raw.get("ingested_at", ""),
     }
+    canonical.update({f"src_{c}": e.raw.get(c, "") for c in raw_cols})
+    return canonical
 
 
 def write_outputs(run: PipelineRun, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     result, columns = run.result, run.columns
 
+    accepted_raw_cols = list(columns)
+    if any("_overflow" in e.raw for e in result.accepted):
+        accepted_raw_cols.append("_overflow")
     _write_csv(
         out_dir / "clean_trades.csv",
-        CLEAN_COLUMNS,
-        [_clean_row(e) for e in result.accepted],
+        CANONICAL_COLUMNS + [f"src_{c}" for c in accepted_raw_cols],
+        [_clean_row(e, accepted_raw_cols) for e in result.accepted],
     )
     _write_csv(
         out_dir / "dead_letter.csv",
-        columns + ["reasons", "retryable", "details"],
+        columns + ["reasons", "retryable", "details", "_overflow"],
         [
             {
                 **e.raw,
