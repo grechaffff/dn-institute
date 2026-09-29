@@ -8,7 +8,7 @@ A small, reusable validator that sits between a trade event feed (blockchain ind
 | duplicate | copy of an event already accepted, dropped | `output/duplicates.csv` |
 | dead letter | cannot be trusted as-is, kept with reasons for repair or replay | `output/dead_letter.csv` |
 
-Nothing is dropped silently. Every decision is recorded with a reason code in `output/report.json`, and every output row keeps the original raw values for lineage.
+Nothing is dropped silently. Every decision is recorded with a reason code in `output/report.json`. The dead-letter and duplicate files keep the original raw values verbatim; `clean_trades.csv` carries the canonical (normalised) values used for analytics **and** the original source values in `src_*` columns, so every output row is still traceable to its input.
 
 The validator and pipeline use only the Python standard library. `pytest` is needed for the tests only.
 
@@ -101,6 +101,8 @@ evt_005 is a real trade: it has a transaction hash, wallet, side and amount. Onl
 2. otherwise calls an optional `resolver(tx_hash)`, for example a node or indexer lookup;
 3. if both fail, sends the row to `dead_letter.csv` with `retryable=true`, the raw values unchanged, so it can be replayed once the time is known.
 
+A backfilled row keeps its original (null) `block_time` in the raw/source columns and only fills the canonical value, so lineage still records that the time was recovered rather than supplied by the feed.
+
 With no resolver configured, as in the sample run, evt_005 ends up in the dead-letter queue. The test `test_evt005_is_backfilled_when_a_resolver_knows_the_tx` shows the same row being accepted when a resolver returns a time.
 
 Why not the alternatives:
@@ -133,7 +135,7 @@ Every rejected or modified row keeps its raw form and reason, so any metric can 
 `validator.py` runs the stages in this order:
 
 1. **Parse and schema checks** per row: required fields, `side` in {BUY, SELL} (case-insensitive), `amount` a finite number above zero, parseable timestamps, surplus fields that indicate shifted columns.
-2. **`event_id` uniqueness:** the same id with the same content is a duplicate; the same id with different content sends both rows to the dead-letter queue (`EVENT_ID_CONFLICT`).
+2. **`event_id` uniqueness:** the same id with identical content is a duplicate; if any rows sharing an id disagree on content, *every* row with that id goes to the dead-letter queue (`EVENT_ID_CONFLICT`) rather than one being trusted as the original.
 3. **Block time consistency:** all events of one transaction must share one `block_time`. Disagreement, for example after a reorg, sends the whole transaction to the dead-letter queue (`BLOCK_TIME_CONFLICT`).
 4. **Backfill** of missing `block_time` (see evt_005 above).
 5. **Trade deduplication** by trade identity, keeping the first copy in arrival order.
@@ -145,12 +147,24 @@ Accepted trades are returned sorted by `block_time`. `pipeline.py` reads the CSV
 
 Checks that the sample does not trigger but real feeds will:
 
-- Hex identifiers (`0x...`) are lowercased before comparison, because EVM addresses are case-insensitive. Other formats, such as base58, are case-sensitive and kept as-is.
+- Hex identifiers (`0x...`) are lowercased before comparison, because EVM addresses are case-insensitive; mixed-case is only a checksum ([EIP-55](https://eips.ethereum.org/EIPS/eip-55)). Other formats, such as [base58](https://digitalbazaar.github.io/base58-spec/) (used by Bitcoin and Solana), are case-sensitive and kept as-is.
 - `120000`, `120000.0` and `1.2E+5` are treated as the same amount.
 - Timestamps are accepted as ISO-8601 (with `Z`, an offset, or naive, taken as UTC), Unix seconds or milliseconds, or time-only with `--feed-date`.
+- A present-but-unparseable `ingested_at` is flagged as `INVALID_INGESTED_AT`, kept distinct from an absent one (`MISSING_INGESTED_AT`) so reports can tell broken metadata from missing metadata.
 - `--strict-ids` enforces full-length EVM addresses and transaction hashes. It is off by default because the sample uses shortened identifiers.
-- `--sqlite trades.sqlite` loads accepted trades into a table whose primary key is the trade identity, so re-running a batch or receiving a replay in a later batch does not add rows. `test_sqlite_sink_is_idempotent_across_batches` covers this.
-- `--fail-on-dead-letter` exits with code 1 when anything was dead-lettered, so an orchestrator or CI job can stop downstream steps. A missing required column exits with code 2.
+- `--sqlite trades.sqlite` loads accepted trades into a table whose primary key is the trade identity, so re-running a batch or receiving an exact replay in a later batch does not add rows. A later row with the same trade key but a different `block_time` (for example after a reorg) is **not** overwritten: it is reported under `sqlite_conflicts` in the report so stale analytics data is never replaced silently. `test_sqlite_sink_is_idempotent_across_batches` and `test_sqlite_conflict_is_reported_not_silently_overwritten` cover this.
+- `--fail-on-dead-letter` exits with code 1 when anything was dead-lettered, so an orchestrator or CI job can stop downstream steps.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | at least one row was dead-lettered (only with `--fail-on-dead-letter`) |
+| 2 | bad input: file missing/unreadable, or a required column absent |
+| 3 | writing outputs or loading the SQLite sink failed |
+
+Codes 2 and 3 are kept distinct so an orchestrator can tell a malformed feed (retry pointless) apart from an I/O or sink failure (retry may help), and neither is confused with the dead-letter signal on code 1.
 
 ### Options
 

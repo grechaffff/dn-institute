@@ -5,7 +5,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from pipeline import EXIT_BAD_INPUT, EXIT_DEAD_LETTER, EXIT_OK, main
+from pipeline import EXIT_BAD_INPUT, EXIT_DEAD_LETTER, EXIT_IO, EXIT_OK, main, run_pipeline
 
 SAMPLE = Path(__file__).resolve().parent.parent / "sample_feed.csv"
 
@@ -40,6 +40,61 @@ def test_original_values_are_preserved_for_lineage(tmp_path):
     dead = read_csv(tmp_path / "dead_letter.csv")[0]
     assert dead["block_time"] == "null"
     assert dead["wallet"] == "0xE5…"  # raw casing kept; normalisation is internal
+
+
+def test_clean_output_is_canonical_but_keeps_source_values(tmp_path):
+    # a feed where side and amount need normalising
+    feed = tmp_path / "feed.csv"
+    feed.write_text(
+        "event_id,tx_hash,block_time,wallet,side,amount,ingested_at\n"
+        "e1,0xAB,2026-01-01T00:00:00Z,0xWW, buy ,120000.0,2026-01-01T00:00:01Z\n",
+        encoding="utf-8",
+    )
+    assert main([str(feed), "--out", str(tmp_path / "out")]) == EXIT_OK
+    clean = read_csv(tmp_path / "out" / "clean_trades.csv")[0]
+    assert clean["side"] == "BUY" and clean["amount"] == "120000"  # canonical for analytics
+    assert clean["wallet"] == "0xww"  # hex lowercased
+    assert clean["src_side"] == " buy " and clean["src_amount"] == "120000.0"  # lineage
+
+
+def test_report_json_includes_sqlite_stats(tmp_path):
+    db = tmp_path / "trades.sqlite"
+    assert main([str(SAMPLE), "--out", str(tmp_path / "out"), "--sqlite", str(db)]) == EXIT_OK
+    report = json.loads((tmp_path / "out" / "report.json").read_text(encoding="utf-8"))
+    assert report["sqlite_rows_inserted"] == 5  # present on disk, not only in the console
+
+
+def test_sqlite_conflict_is_reported_not_silently_overwritten(tmp_path):
+    db = tmp_path / "trades.sqlite"
+    first = tmp_path / "a.csv"
+    first.write_text(
+        "event_id,tx_hash,block_time,wallet,side,amount,ingested_at\n"
+        "e1,0xAB,2026-01-01T00:00:00Z,0xWW,BUY,10,2026-01-01T00:00:01Z\n",
+        encoding="utf-8",
+    )
+    run_pipeline(first, sqlite_path=db)
+
+    # same trade key, but a different block_time (e.g. a reorg)
+    second = tmp_path / "b.csv"
+    second.write_text(
+        "event_id,tx_hash,block_time,wallet,side,amount,ingested_at\n"
+        "e2,0xAB,2026-01-01T06:00:00Z,0xWW,BUY,10,2026-01-01T06:00:01Z\n",
+        encoding="utf-8",
+    )
+    run = run_pipeline(second, sqlite_path=db)
+    assert run.report["sqlite_rows_inserted"] == 0
+    assert len(run.report["sqlite_conflicts"]) == 1
+
+    with sqlite3.connect(str(db)) as conn:
+        stored = conn.execute("SELECT block_time FROM trades").fetchall()
+    assert stored == [("2026-01-01T00:00:00Z",)]  # original value kept, not overwritten
+
+
+def test_output_write_failure_uses_its_own_exit_code(tmp_path):
+    # point --out at a path blocked by an existing file so mkdir fails
+    blocker = tmp_path / "blocked"
+    blocker.write_text("i am a file, not a directory", encoding="utf-8")
+    assert main([str(SAMPLE), "--out", str(blocker / "sub")]) == EXIT_IO
 
 
 def test_fail_on_dead_letter_exit_code(tmp_path):

@@ -43,6 +43,14 @@ from validator import (
 EXIT_OK = 0
 EXIT_DEAD_LETTER = 1
 EXIT_BAD_INPUT = 2
+EXIT_IO = 3  # writing outputs or loading the SQLite sink failed
+
+CLEAN_COLUMNS = [
+    # canonical values for analytics ...
+    "event_id", "tx_hash", "block_time", "wallet", "side", "amount", "ingested_at", "dq_flags",
+    # ... plus the original source values, for lineage/audit
+    "src_tx_hash", "src_block_time", "src_wallet", "src_side", "src_amount", "src_ingested_at",
+]
 
 
 class SchemaError(Exception):
@@ -79,14 +87,35 @@ def _is_retryable(event: TradeEvent) -> bool:
     return bool(errors) and errors <= RETRYABLE_CODES
 
 
+def _clean_row(e: TradeEvent) -> dict:
+    """Analytics row: canonical (normalised) fields, plus the raw source
+    values under ``src_*`` so lineage is preserved in the same record."""
+    return {
+        "event_id": e.event_id,
+        "tx_hash": e.tx_hash,
+        "block_time": format_timestamp(e.block_time),
+        "wallet": e.wallet,
+        "side": e.side,
+        "amount": canonical_amount(e.amount),
+        "ingested_at": format_timestamp(e.ingested_at) if e.ingested_at else "",
+        "dq_flags": ";".join(e.flags),
+        "src_tx_hash": e.raw.get("tx_hash", ""),
+        "src_block_time": e.raw.get("block_time", ""),
+        "src_wallet": e.raw.get("wallet", ""),
+        "src_side": e.raw.get("side", ""),
+        "src_amount": e.raw.get("amount", ""),
+        "src_ingested_at": e.raw.get("ingested_at", ""),
+    }
+
+
 def write_outputs(run: PipelineRun, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     result, columns = run.result, run.columns
 
     _write_csv(
         out_dir / "clean_trades.csv",
-        columns + ["dq_flags"],
-        [{**e.raw, "dq_flags": ";".join(e.flags)} for e in result.accepted],
+        CLEAN_COLUMNS,
+        [_clean_row(e) for e in result.accepted],
     )
     _write_csv(
         out_dir / "dead_letter.csv",
@@ -131,14 +160,19 @@ def build_report(result: ValidationResult) -> dict:
     }
 
 
-def load_sqlite(result: ValidationResult, db_path: Path) -> int:
-    """Idempotently load accepted trades into SQLite; return rows inserted.
+def load_sqlite(result: ValidationResult, db_path: Path) -> tuple:
+    """Idempotently load accepted trades into SQLite.
 
-    The primary key is the trade identity (not event_id), so replays that
-    arrive in a later batch are ignored instead of double-counted. With a
-    log_index in the feed the key would be (tx_hash, log_index).
+    Returns ``(rows_inserted, conflicts)``. The primary key is the trade
+    identity (not event_id), so an exact replay arriving in a later batch is
+    ignored instead of double-counted. A row whose key already exists but whose
+    ``block_time`` disagrees is **not** overwritten and is reported as a
+    conflict, so a reorg or indexer bug cannot silently replace analytics data.
+    With a log_index in the feed the key would be (tx_hash, log_index).
     """
     conn = sqlite3.connect(str(db_path))
+    inserted = 0
+    conflicts: List[dict] = []
     try:
         conn.execute(
             """
@@ -155,27 +189,67 @@ def load_sqlite(result: ValidationResult, db_path: Path) -> int:
             )
             """
         )
-        before = conn.total_changes
-        conn.executemany(
-            "INSERT OR IGNORE INTO trades VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    e.tx_hash,
-                    e.wallet,
-                    e.side,
-                    canonical_amount(e.amount),
-                    format_timestamp(e.block_time),
-                    e.event_id,
-                    format_timestamp(e.ingested_at) if e.ingested_at else None,
-                    ";".join(e.flags),
+        for e in result.accepted:
+            key = (e.tx_hash, e.wallet, e.side, canonical_amount(e.amount))
+            block_time = format_timestamp(e.block_time)
+            existing = conn.execute(
+                "SELECT block_time, event_id FROM trades "
+                "WHERE tx_hash = ? AND wallet = ? AND side = ? AND amount = ?",
+                key,
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO trades VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        *key,
+                        block_time,
+                        e.event_id,
+                        format_timestamp(e.ingested_at) if e.ingested_at else None,
+                        ";".join(e.flags),
+                    ),
                 )
-                for e in result.accepted
-            ],
-        )
+                inserted += 1
+            elif existing[0] != block_time:
+                conflicts.append(
+                    {
+                        "trade": list(key),
+                        "stored_block_time": existing[0],
+                        "incoming_block_time": block_time,
+                        "stored_event_id": existing[1],
+                        "incoming_event_id": e.event_id,
+                    }
+                )
+            # else: same key, same block_time -> idempotent replay, ignored.
         conn.commit()
-        return conn.total_changes - before
+        return inserted, conflicts
     finally:
         conn.close()
+
+
+def _prepare(
+    input_path: Path,
+    config: Optional[ValidatorConfig] = None,
+    resolver: Optional[BlockTimeResolver] = None,
+) -> PipelineRun:
+    """Read + validate. Raises SchemaError/OSError on bad input."""
+    columns, rows = read_feed(input_path)
+    result = validate_feed(rows, config, resolver)
+    return PipelineRun(result=result, columns=columns, report=build_report(result))
+
+
+def _emit(run: PipelineRun, out_dir: Optional[Path], sqlite_path: Optional[Path]) -> None:
+    """Load the sink and write outputs. Raises sqlite3.Error/OSError on failure.
+
+    The sink runs first so the SQLite statistics are present in every
+    representation of the report, including the ``report.json`` on disk.
+    """
+    if sqlite_path is not None:
+        inserted, conflicts = load_sqlite(run.result, sqlite_path)
+        run.report["sqlite_rows_inserted"] = inserted
+        if conflicts:
+            run.report["sqlite_conflicts"] = conflicts
+    if out_dir is not None:
+        write_outputs(run, out_dir)
 
 
 def run_pipeline(
@@ -185,13 +259,8 @@ def run_pipeline(
     resolver: Optional[BlockTimeResolver] = None,
     sqlite_path: Optional[Path] = None,
 ) -> PipelineRun:
-    columns, rows = read_feed(input_path)
-    result = validate_feed(rows, config, resolver)
-    run = PipelineRun(result=result, columns=columns, report=build_report(result))
-    if out_dir is not None:
-        write_outputs(run, out_dir)
-    if sqlite_path is not None:
-        run.report["sqlite_rows_inserted"] = load_sqlite(result, sqlite_path)
+    run = _prepare(input_path, config, resolver)
+    _emit(run, out_dir, sqlite_path)
     return run
 
 
@@ -211,6 +280,8 @@ def print_summary(run: PipelineRun, out: Optional[Path]) -> None:
         print(f"outputs written to {out}/")
     if "sqlite_rows_inserted" in r:
         print(f"sqlite rows inserted: {r['sqlite_rows_inserted']}")
+    if r.get("sqlite_conflicts"):
+        print(f"sqlite conflicts (same trade, different block_time): {len(r['sqlite_conflicts'])}")
 
 
 def parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
@@ -243,10 +314,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         strict_identifiers=args.strict_ids,
     )
     try:
-        run = run_pipeline(args.input, args.out, config, sqlite_path=args.sqlite)
+        run = _prepare(args.input, config)
     except (SchemaError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_BAD_INPUT
+    try:
+        _emit(run, args.out, args.sqlite)
+    except (sqlite3.Error, OSError) as exc:
+        print(f"error writing outputs: {exc}", file=sys.stderr)
+        return EXIT_IO
     print_summary(run, args.out)
     if args.fail_on_dead_letter and run.result.dead_letter:
         return EXIT_DEAD_LETTER

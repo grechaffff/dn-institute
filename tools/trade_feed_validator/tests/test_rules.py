@@ -72,6 +72,18 @@ def test_duplicate_detected_across_amount_formatting():
     assert result.events[1].status is Status.DUPLICATE
 
 
+def test_duplicate_with_earlier_ingestion_time_is_not_described_as_later():
+    # the copy carries an earlier ingested_at than the original it duplicates
+    result = validate_feed([
+        row(event_id="e1", ingested_at="2026-09-28T10:00:10Z"),
+        row(event_id="e2", ingested_at="2026-09-28T10:00:04Z"),
+    ])
+    dup = result.events[1]
+    assert dup.status is Status.DUPLICATE
+    assert "before the original" in dup.issues[0].message
+    assert "after the original" not in dup.issues[0].message
+
+
 def test_non_hex_identifiers_keep_their_case():
     # base58 (e.g. Solana) is case-sensitive: these are two different wallets
     result = validate_feed([
@@ -91,6 +103,15 @@ def test_same_event_id_different_payload_quarantines_both():
     result = validate_feed([row(amount="100"), row(amount="999")])
     assert all(e.status is Status.DEAD_LETTER for e in result.events)
     assert all(Code.EVENT_ID_CONFLICT in codes(e) for e in result.events)
+
+
+def test_event_id_conflict_dead_letters_every_member_even_a_repeat():
+    # payloads A, B, A under one id: the third row must not become a "duplicate"
+    # of the now-dead-lettered first row -- all three are conflicts.
+    result = validate_feed([row(amount="100"), row(amount="999"), row(amount="100")])
+    assert all(e.status is Status.DEAD_LETTER for e in result.events)
+    assert all(Code.EVENT_ID_CONFLICT in codes(e) for e in result.events)
+    assert not any(Code.DUPLICATE_EVENT_ID in codes(e) for e in result.events)
 
 
 # --- block_time ----------------------------------------------------------
@@ -116,6 +137,13 @@ def test_missing_block_time_is_backfilled_from_a_sibling_in_the_same_tx():
 def test_incomplete_copy_of_a_trade_is_backfilled_then_deduplicated():
     result = validate_feed([row(event_id="e1"), row(event_id="e2", block_time="")])
     assert result.events[1].status is Status.DUPLICATE
+
+
+def test_backfill_fills_canonical_time_but_keeps_raw_null_for_lineage():
+    result = validate_feed([row(event_id="e1"), row(event_id="e2", amount="7", block_time="null")])
+    evt = result.events[1]
+    assert evt.block_time == result.events[0].block_time  # canonical value filled
+    assert evt.raw["block_time"] == "null"  # raw source preserved unchanged
 
 
 @pytest.mark.parametrize("resolver", [lambda tx: None, lambda tx: 1 / 0], ids=["returns_none", "raises"])
@@ -166,12 +194,28 @@ def test_missing_ingested_at_keeps_the_trade_with_a_warning():
     assert codes(evt) == [Code.MISSING_INGESTED_AT]
 
 
+def test_invalid_ingested_at_is_distinct_from_missing():
+    # a present-but-unparseable timestamp must not look like absent metadata
+    evt = validate_feed([row(ingested_at="not-a-time")]).events[0]
+    assert evt.status is Status.ACCEPTED
+    assert codes(evt) == [Code.INVALID_INGESTED_AT]
+
+
 def test_row_with_extra_fields_is_quarantined():
     raw = row()
     raw[None] = ["unexpected"]  # how csv.DictReader reports surplus columns
     evt = validate_feed([raw]).events[0]
     assert Code.MALFORMED_ROW in codes(evt)
     assert evt.status is Status.DEAD_LETTER
+
+
+def test_surplus_fields_are_preserved_for_repair():
+    raw = row()
+    raw[None] = ["shifted-value"]
+    evt = validate_feed([raw]).events[0]
+    # the overflow is kept verbatim (raw record) and surfaced in the reason
+    assert evt.raw["_overflow"] == "shifted-value"
+    assert "shifted-value" in evt.issues[0].message
 
 
 def test_strict_identifiers():

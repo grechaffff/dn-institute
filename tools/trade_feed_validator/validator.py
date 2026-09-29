@@ -71,6 +71,7 @@ class Code(str, Enum):
     INGESTED_BEFORE_BLOCK_TIME = "INGESTED_BEFORE_BLOCK_TIME"
     INGESTION_TIME_REGRESSION = "INGESTION_TIME_REGRESSION"
     MISSING_INGESTED_AT = "MISSING_INGESTED_AT"
+    INVALID_INGESTED_AT = "INVALID_INGESTED_AT"
     LATE_ARRIVAL = "LATE_ARRIVAL"
     OUT_OF_ORDER_ARRIVAL = "OUT_OF_ORDER_ARRIVAL"
 
@@ -264,6 +265,13 @@ def parse_row(row_num: int, raw: Mapping[Optional[str], object], config: Validat
     """Parse one raw row and run the per-row (schema) checks."""
     extra_values = raw.get(None)  # csv.DictReader puts surplus fields here
     clean_raw = {k: ("" if v is None else str(v)) for k, v in raw.items() if k is not None}
+
+    if extra_values:
+        # Keep the overflow verbatim so a shifted-column row can still be
+        # repaired from the dead-letter file; nothing is discarded.
+        overflow = extra_values if isinstance(extra_values, list) else [extra_values]
+        clean_raw["_overflow"] = " | ".join("" if v is None else str(v) for v in overflow)
+
     event = TradeEvent(row=row_num, raw=clean_raw)
 
     if not is_null(clean_raw.get("event_id")):
@@ -273,7 +281,8 @@ def parse_row(row_num: int, raw: Mapping[Optional[str], object], config: Validat
         event.add_issue(
             Code.MALFORMED_ROW,
             Severity.ERROR,
-            f"row has {len(extra_values)} more field(s) than the header; columns may be shifted",
+            f"row has {len(overflow)} more field(s) than the header; columns may be shifted "
+            f"(surplus values: {clean_raw['_overflow']})",
         )
 
     for name in ("event_id", "tx_hash", "wallet", "side", "amount"):
@@ -346,7 +355,7 @@ def parse_row(row_num: int, raw: Mapping[Optional[str], object], config: Validat
             event.ingested_at = parse_timestamp(ingested_at, config.feed_date)
         except ValueError:
             event.add_issue(
-                Code.MISSING_INGESTED_AT,
+                Code.INVALID_INGESTED_AT,
                 Severity.WARNING,
                 f"ingested_at '{ingested_at}' cannot be parsed; timeliness checks skipped",
             )
@@ -365,15 +374,27 @@ def _payload(event: TradeEvent) -> Tuple:
 
 
 def check_event_ids(events: List[TradeEvent]) -> None:
-    first_seen: Dict[str, TradeEvent] = {}
+    groups: Dict[str, List[TradeEvent]] = {}
     for event in events:
-        if event.event_id is None:
+        if event.event_id is not None:
+            groups.setdefault(event.event_id, []).append(event)
+
+    for event_id, group in groups.items():
+        if len(group) < 2:
             continue
-        original = first_seen.get(event.event_id)
-        if original is None:
-            first_seen[event.event_id] = event
+        # If any two rows sharing this id disagree on content, the id is
+        # ambiguous: dead-letter every member rather than trusting one as the
+        # "original" and marking the rest duplicates of a quarantined row.
+        if len({_payload(e) for e in group}) > 1:
+            rows = ", ".join(str(e.row) for e in group)
+            message = f"event_id '{event_id}' is used by rows {rows} with different content"
+            related = [e.label for e in group]
+            for e in group:
+                e.add_issue(Code.EVENT_ID_CONFLICT, Severity.ERROR, message, related)
             continue
-        if _payload(original) == _payload(event):
+        # All identical: keep the first delivery, drop the rest.
+        original = group[0]
+        for event in group[1:]:
             event.duplicate_of = original.event_id
             event.add_issue(
                 Code.DUPLICATE_EVENT_ID,
@@ -381,13 +402,6 @@ def check_event_ids(events: List[TradeEvent]) -> None:
                 f"event_id re-delivered with identical content (first seen at row {original.row})",
                 [original.label],
             )
-        else:
-            message = (
-                f"event_id '{event.event_id}' is used by rows {original.row} and {event.row} "
-                "with different content"
-            )
-            for e in (original, event):
-                e.add_issue(Code.EVENT_ID_CONFLICT, Severity.ERROR, message, [original.label, event.label])
 
 
 def check_block_time_consistency(events: List[TradeEvent]) -> None:
@@ -429,8 +443,9 @@ def backfill_block_times(
 
         sibling = known.get(event.tx_hash)
         if sibling is not None:
+            # Fill the canonical block_time only; raw keeps its original null
+            # so lineage still shows the value was recovered, not supplied.
             event.block_time = sibling.block_time
-            event.raw["block_time"] = sibling.raw.get("block_time", format_timestamp(sibling.block_time))
             event.add_issue(
                 Code.BLOCK_TIME_BACKFILLED,
                 Severity.INFO,
@@ -450,7 +465,6 @@ def backfill_block_times(
             if resolved.tzinfo is None:
                 resolved = resolved.replace(tzinfo=timezone.utc)
             event.block_time = resolved.astimezone(timezone.utc)
-            event.raw["block_time"] = format_timestamp(event.block_time)
             event.add_issue(
                 Code.BLOCK_TIME_BACKFILLED,
                 Severity.INFO,
@@ -479,8 +493,13 @@ def deduplicate_trades(events: List[TradeEvent]) -> None:
             delay = event.ingested_at - original.ingested_at
             if delay == timedelta(0):
                 how = "delivered twice with the same ingestion time (double emit)"
-            else:
+            elif delay > timedelta(0):
                 how = f"re-delivered {_seconds(delay)} after the original (replay)"
+            else:
+                how = (
+                    f"delivered {_seconds(delay)} before the original in ingestion time; "
+                    "ingestion clock disagreement"
+                )
         else:
             how = "repeated delivery"
         event.duplicate_of = original.event_id
